@@ -30,6 +30,8 @@ void main(
 
   r0.xy = floor(v1.xy);
   r0.xy = float2(-0.5,-0.5) + r0.xy;
+  // With fixed scale upscaling the input is an output resolution sized twin
+  const float2 inputInvExtent = LumaData.GameData.FixedScaleUpscaling ? LumaData.GameData.OutputResolution.zw : cb0[0].zw;
   r0.zw = rcp(cb0[21].zw);
   r0.zw = resolution.xy * r0.zw;
   r0.xy = r0.xy * r0.zw + float2(0.5,0.5);
@@ -61,7 +63,7 @@ void main(
   r1.yw = r1.yw * float2(2,2) + float2(-1,-1);
   r1.yw = float2(1,1) + -abs(r1.yw);
   r1.yw = r1.yw * r5.xy + float2(0.5,0.5);
-  r1.yw = cb0[0].zw * r1.yw;
+  r1.yw = inputInvExtent * r1.yw;
   r6.xyz = t0.SampleLevel(s0_s, r1.yw, 0).xyz;
   r6.xyz = min(float3(65504,65504,65504), r6.xyz);
   r6.xyz = r6.xyz * r4.xxx;
@@ -82,7 +84,7 @@ void main(
   r1.yw = r1.yw * float2(2,2) + float2(-1,-1);
   r1.yw = float2(1,1) + -abs(r1.yw);
   r1.yw = r1.yw * r5.xy + float2(0.5,0.5);
-  r1.yw = cb0[0].zw * r1.yw;
+  r1.yw = inputInvExtent * r1.yw;
   r9.xyz = t0.SampleLevel(s0_s, r1.yw, 0).xyz;
   r9.xyz = min(float3(65504,65504,65504), r9.xyz);
   r9.xyz = r9.xyz * r7.xxx;
@@ -99,7 +101,7 @@ void main(
   r1.xz = r1.xz * float2(2,2) + float2(-1,-1);
   r1.xz = float2(1,1) + -abs(r1.xz);
   r1.xz = r1.xz * r5.xy + float2(0.5,0.5);
-  r1.xz = cb0[0].zw * r1.xz;
+  r1.xz = inputInvExtent * r1.xz;
   r2.xyz = t0.SampleLevel(s0_s, r1.xz, 0).xyz;
   r2.xyz = min(float3(65504,65504,65504), r2.xyz);
   r2.xyz = r2.xyz * r4.xxx;
@@ -114,7 +116,7 @@ void main(
   r0.yz = r0.yz * float2(2,2) + float2(-1,-1);
   r0.yz = float2(1,1) + -abs(r0.yz);
   r0.yz = r0.yz * r5.xy + float2(0.5,0.5);
-  r0.yz = cb0[0].zw * r0.yz;
+  r0.yz = inputInvExtent * r0.yz;
   r0.yzw = t0.SampleLevel(s0_s, r0.yz, 0).xyz;
   r0.yzw = min(float3(65504,65504,65504), r0.yzw);
   r0.yzw = r0.yzw * r7.xxx;

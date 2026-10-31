@@ -39,6 +39,8 @@ namespace CB
 		uint4 ViewportRect;
 		float2 ResolutionScale; //Scale, InvScale
 		uint DrewUpscaling;
+		// The scene was upscaled into output resolution copies of render resolution sized textures (fixed render scale, no DRS), so their extent is the output resolution
+		uint FixedScaleUpscaling;
 	};
 }
 

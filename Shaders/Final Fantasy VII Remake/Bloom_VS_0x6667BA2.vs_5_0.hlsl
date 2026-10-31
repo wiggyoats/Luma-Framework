@@ -37,7 +37,7 @@ void main(
   }
 
   r0.xy = v1.xy * renderResolution.xy + cb1[1].zw;
-  o0.xy = cb2[2].zw * r0.xy;
+  o0.xy = (LumaData.GameData.FixedScaleUpscaling ? LumaData.GameData.OutputResolution.zw : cb2[2].zw) * r0.xy;
   o1.z = cb1[24].x * renderResolution.x;
   o1.w = renderResolution.x;
   r0.xy = v0.xy * renderResolution.xy + cb2[0].zw;
