@@ -337,7 +337,7 @@ void main(
     r2.xy = min(float2(1,1), r2.xy);
     r1.xy = r1.xy * r2.xy + float2(0.5,0.5);
     r1.zw = r1.zw * resolution.xy + cb0[30].xy;
-    r1.zw = cb0[0].zw * r1.zw;
+    r1.zw = (LumaData.GameData.FixedScaleUpscaling ? LumaData.GameData.OutputResolution.zw : cb0[0].zw) * r1.zw;
 
     float2 pixelPos = r1.xy;
     float2 uvCoord = r1.zw;

@@ -28,7 +28,7 @@ void main(
     resolutionScale = 1.0f;
   }
   r0.xy = v1.xy * (resolution.xy) + (cb0[1].zw * resolutionScale);
-  o0.xy = cb0[2].zw * r0.xy;
+  o0.xy = (LumaData.GameData.FixedScaleUpscaling ? LumaData.GameData.OutputResolution.zw : cb0[2].zw) * r0.xy;
   r0.xy = v0.xy * (resolution.xy) + (cb0[0].zw * resolutionScale);
   r0.xy = (resolution.zw) * r0.xy;
   r0.xy = r0.xy * float2(2,2) + float2(-1,-1);

@@ -2,6 +2,8 @@
 
 #define LUMA_PATCH_BYTECODE_SYNC 0
 #define CHECK_GRAPHICS_API_COMPATIBILITY 1
+// Needed to re-draw the post processing passes into the output resolution textures with a fixed render scale (see "DrawFixedScaleTwinPass()")
+#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 #ifdef _DEBUG
 #define ALLOW_SHADERS_DUMPING 1
 #define ALLOW_SHADER_PATCHES_DUMPING 1
@@ -322,6 +324,14 @@ namespace
    }
 } // namespace
 
+// An output resolution copy of a render resolution sized game texture, see "GameDeviceDataFF7Remake::fixed_scale_twins"
+struct FixedScaleTwin
+{
+   com_ptr<ID3D11Texture2D> texture;
+   com_ptr<ID3D11ShaderResourceView> srv;
+   com_ptr<ID3D11RenderTargetView> rtv;
+};
+
 struct GameDeviceDataFF7Remake final : public GameDeviceData
 {
 #if ENABLE_SR
@@ -350,6 +360,25 @@ struct GameDeviceDataFF7Remake final : public GameDeviceData
    float2 upscaled_render_resolution = {1, 1};
    float resolution_scale = 1.0f;
    uint4 viewport_rect = {0, 0, 1, 1};
+
+   // Fixed render scale upscaling.
+   // Under DX11 the game's DRS never engages, so the render resolution can only be lowered with "r.ScreenPercentage",
+   // which shrinks the scene textures themselves (instead of rendering in the top left of output sized ones, like DRS does).
+   // SR then writes into an output resolution "twin" of the TAA output, and each following post process pass that reads a twin
+   // is drawn twice: natively at render resolution (for everything that keeps reading the original textures), and into twins of its targets.
+   // The output pass then reads the twins instead of upscaling the render resolution image.
+   // Keyed by the game texture (not ref counted, the twin desc is validated on every use)
+   std::unordered_map<ID3D11Resource*, FixedScaleTwin> fixed_scale_twins;
+   // Game textures whose twin holds this frame's image
+   std::unordered_set<ID3D11Resource*> valid_fixed_scale_twins;
+   uint2 fixed_scale_render_target_size = {0, 0}; // The scene textures size (UE pads it a bit beyond the render resolution)
+   uint2 fixed_scale_render_size = {0, 0};
+   uint2 fixed_scale_output_size = {0, 0};
+   // SR upscaled into a twin this frame
+   bool fixed_scale_upscaling = false;
+   // A pass is currently being drawn into twins (or the output pass reads them), the shaders need to treat their inputs as output resolution sized
+   bool drawing_fixed_scale_twin = false;
+   std::unordered_set<uint32_t> logged_fixed_scale_chain_breakers;
 
    // Output HDR two-pass split: intermediate hudless render target (R10G10B10A2_UNORM, PQ-encoded)
 #if ENABLE_FRAMEGEN
@@ -843,7 +872,8 @@ public:
 
    static bool GetEarlyUpscaleTargetResolution(ID3D11DeviceContext* native_device_context, DeviceData& device_data, GameDeviceDataFF7Remake& game_device_data, UINT& width, UINT& height)
    {
-      if (device_data.has_drawn_main_post_processing || !device_data.has_drawn_sr || !game_device_data.drs_active || !game_device_data.found_per_view_globals)
+      // With a fixed render scale, the post processing targets keep their (render) size, the twins are drawn separately
+      if (device_data.has_drawn_main_post_processing || !device_data.has_drawn_sr || !game_device_data.drs_active || !game_device_data.found_per_view_globals || game_device_data.fixed_scale_upscaling)
       {
          return false;
       }
@@ -986,6 +1016,252 @@ public:
       }
    }
 
+   static FixedScaleTwin* GetOrCreateFixedScaleTwin(ID3D11Device* native_device, GameDeviceDataFF7Remake& game_device_data, ID3D11Resource* resource, bool unordered_access)
+   {
+      com_ptr<ID3D11Texture2D> texture;
+      if (resource == nullptr || FAILED(resource->QueryInterface(&texture)))
+      {
+         return nullptr;
+      }
+      D3D11_TEXTURE2D_DESC desc;
+      texture->GetDesc(&desc);
+      if (desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
+      {
+         return nullptr;
+      }
+      desc.Width = game_device_data.fixed_scale_output_size.x;
+      desc.Height = game_device_data.fixed_scale_output_size.y;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = 0;
+      desc.MiscFlags = 0;
+      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | (unordered_access ? D3D11_BIND_UNORDERED_ACCESS : 0);
+
+      // Pooled targets come and go, don't let stale twins pile up
+      if (game_device_data.fixed_scale_twins.size() > 32 && !game_device_data.fixed_scale_twins.contains(resource))
+      {
+         game_device_data.fixed_scale_twins.clear();
+         game_device_data.valid_fixed_scale_twins.clear();
+      }
+
+      FixedScaleTwin& twin = game_device_data.fixed_scale_twins[resource];
+      if (twin.texture.get())
+      {
+         D3D11_TEXTURE2D_DESC twin_desc;
+         twin.texture->GetDesc(&twin_desc);
+         if (twin_desc.Width == desc.Width && twin_desc.Height == desc.Height && twin_desc.Format == desc.Format && (twin_desc.BindFlags & desc.BindFlags) == desc.BindFlags)
+         {
+            return &twin;
+         }
+         twin = {};
+      }
+      if (FAILED(native_device->CreateTexture2D(&desc, nullptr, &twin.texture))
+         || FAILED(native_device->CreateShaderResourceView(twin.texture.get(), nullptr, &twin.srv))
+         || FAILED(native_device->CreateRenderTargetView(twin.texture.get(), nullptr, &twin.rtv)))
+      {
+         game_device_data.fixed_scale_twins.erase(resource);
+         return nullptr;
+      }
+      return &twin;
+   }
+
+   // Stops drawing twins for this frame, the output pass will fall back to the game's own upscaling
+   static void BreakFixedScaleChain(GameDeviceDataFF7Remake& game_device_data, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, const char* reason)
+   {
+      game_device_data.fixed_scale_upscaling = false;
+      game_device_data.valid_fixed_scale_twins.clear();
+      const uint32_t hash = Shader::ShaderHashesEmpty(original_shader_hashes.pixel_shaders) ? 0 : static_cast<uint32_t>(original_shader_hashes.pixel_shaders[0]);
+      if (game_device_data.logged_fixed_scale_chain_breakers.emplace(hash).second)
+      {
+         const std::string message = std::string("Fixed scale upscaling: pass ") + Shader::Hash_NumToStr(hash) + " " + reason + ", using the game's upscaling this frame";
+         reshade::log::message(reshade::log::level::warning, message.c_str());
+      }
+   }
+
+   // Binds the twins of this frame's upscaled textures in place of the game ones, returns whether any was bound
+   static bool BindFixedScaleTwinShaderResources(ID3D11DeviceContext* native_device_context, GameDeviceDataFF7Remake& game_device_data, com_ptr<ID3D11ShaderResourceView> (&original_srvs)[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT])
+   {
+      native_device_context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, &original_srvs[0]);
+      ID3D11ShaderResourceView* twin_srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+      bool any_twin = false;
+      for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+      {
+         twin_srvs[i] = original_srvs[i].get();
+         if (original_srvs[i].get() == nullptr)
+         {
+            continue;
+         }
+         com_ptr<ID3D11Resource> resource;
+         original_srvs[i]->GetResource(&resource);
+         if (game_device_data.valid_fixed_scale_twins.contains(resource.get()))
+         {
+            twin_srvs[i] = game_device_data.fixed_scale_twins[resource.get()].srv.get();
+            any_twin = true;
+         }
+      }
+      if (any_twin)
+      {
+         native_device_context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, twin_srvs);
+      }
+      return any_twin;
+   }
+
+   // Called for the post processing draws between SR and the output pass.
+   // Returns true if the draw was done (both at render resolution, and into the twins at output resolution).
+   static bool DrawFixedScaleTwinPass(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func)
+   {
+      auto& game_device_data = GetGameDeviceData(device_data);
+      if (!game_device_data.fixed_scale_upscaling || device_data.has_drawn_main_post_processing || (stages & reshade::api::shader_stage::pixel) == 0)
+      {
+         return false;
+      }
+
+      com_ptr<ID3D11RenderTargetView> rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+      com_ptr<ID3D11DepthStencilView> dsv;
+      native_device_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, &rtvs[0], &dsv);
+      com_ptr<ID3D11Resource> target;
+      uint2 target_size = {0, 0};
+      if (rtvs[0].get())
+      {
+         rtvs[0]->GetResource(&target);
+         com_ptr<ID3D11Texture2D> target_texture;
+         if (SUCCEEDED(target->QueryInterface(&target_texture)))
+         {
+            D3D11_TEXTURE2D_DESC target_desc;
+            target_texture->GetDesc(&target_desc);
+            target_size = {target_desc.Width, target_desc.Height};
+         }
+      }
+
+      bool reads_twin = false;
+      {
+         com_ptr<ID3D11ShaderResourceView> srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+         native_device_context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, &srvs[0]);
+         for (const auto& srv : srvs)
+         {
+            if (srv.get() == nullptr)
+            {
+               continue;
+            }
+            com_ptr<ID3D11Resource> resource;
+            srv->GetResource(&resource);
+            if (game_device_data.valid_fixed_scale_twins.contains(resource.get()))
+            {
+               reads_twin = true;
+               break;
+            }
+         }
+      }
+
+      const bool writes_scene_target = target.get() != nullptr && target_size.x == game_device_data.fixed_scale_render_target_size.x && target_size.y == game_device_data.fixed_scale_render_target_size.y;
+      if (!reads_twin || !writes_scene_target)
+      {
+         // The game (re)wrote a texture that had a twin, the twin is stale now.
+         // Passes that read twins but don't write scene sized targets (e.g. the bloom downscale) keep reading the render resolution image.
+         for (const auto& rtv : rtvs)
+         {
+            if (rtv.get())
+            {
+               com_ptr<ID3D11Resource> resource;
+               rtv->GetResource(&resource);
+               game_device_data.valid_fixed_scale_twins.erase(resource.get());
+            }
+         }
+         return false;
+      }
+      // Only our replaced shaders know how to draw at output resolution (through "FixedScaleUpscaling")
+      if (!is_custom_pass || original_draw_dispatch_func == nullptr || rtvs[1].get() != nullptr || dsv.get() != nullptr)
+      {
+         BreakFixedScaleChain(game_device_data, original_shader_hashes, "reads the upscaled image but can't be drawn at output resolution");
+         return false;
+      }
+      FixedScaleTwin* target_twin = GetOrCreateFixedScaleTwin(native_device, game_device_data, target.get(), false);
+      if (target_twin == nullptr)
+      {
+         BreakFixedScaleChain(game_device_data, original_shader_hashes, "has a target we couldn't make a twin of");
+         return false;
+      }
+
+      // Draw natively first, so the passes that read the render resolution image keep working
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaSettings);
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
+      (*original_draw_dispatch_func)();
+
+      // Then again into the twin
+      D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      UINT num_viewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+      native_device_context->RSGetViewports(&num_viewports, viewports);
+      D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      UINT num_scissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+      native_device_context->RSGetScissorRects(&num_scissors, scissors);
+
+      com_ptr<ID3D11ShaderResourceView> original_srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+      BindFixedScaleTwinShaderResources(native_device_context, game_device_data, original_srvs);
+      ID3D11RenderTargetView* const twin_rtv = target_twin->rtv.get();
+      native_device_context->OMSetRenderTargets(1, &twin_rtv, nullptr);
+
+      // Scale from the render resolution, not the (padded) texture size, so the render area maps to the whole twin
+      const float scale_x = static_cast<float>(game_device_data.fixed_scale_output_size.x) / static_cast<float>(game_device_data.fixed_scale_render_size.x);
+      const float scale_y = static_cast<float>(game_device_data.fixed_scale_output_size.y) / static_cast<float>(game_device_data.fixed_scale_render_size.y);
+      D3D11_VIEWPORT twin_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      for (UINT i = 0; i < num_viewports; i++)
+      {
+         twin_viewports[i] = viewports[i];
+         twin_viewports[i].TopLeftX = std::round(viewports[i].TopLeftX * scale_x);
+         twin_viewports[i].TopLeftY = std::round(viewports[i].TopLeftY * scale_y);
+         twin_viewports[i].Width = std::round((viewports[i].TopLeftX + viewports[i].Width) * scale_x) - twin_viewports[i].TopLeftX;
+         twin_viewports[i].Height = std::round((viewports[i].TopLeftY + viewports[i].Height) * scale_y) - twin_viewports[i].TopLeftY;
+      }
+      if (num_viewports > 0)
+      {
+         native_device_context->RSSetViewports(num_viewports, twin_viewports);
+      }
+      D3D11_RECT twin_scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+      for (UINT i = 0; i < num_scissors; i++)
+      {
+         twin_scissors[i].left = std::lrintf(scissors[i].left * scale_x);
+         twin_scissors[i].top = std::lrintf(scissors[i].top * scale_y);
+         twin_scissors[i].right = std::lrintf(scissors[i].right * scale_x);
+         twin_scissors[i].bottom = std::lrintf(scissors[i].bottom * scale_y);
+      }
+      if (num_scissors > 0)
+      {
+         native_device_context->RSSetScissorRects(num_scissors, twin_scissors);
+      }
+
+      game_device_data.drawing_fixed_scale_twin = true;
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
+      (*original_draw_dispatch_func)();
+      game_device_data.drawing_fixed_scale_twin = false;
+
+      // Restore the game's state
+      ID3D11ShaderResourceView* const* original_srvs_const = (ID3D11ShaderResourceView**)std::addressof(original_srvs[0]);
+      native_device_context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, original_srvs_const);
+      ID3D11RenderTargetView* const* rtvs_const = (ID3D11RenderTargetView**)std::addressof(rtvs[0]);
+      native_device_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs_const, dsv.get());
+      if (num_viewports > 0)
+      {
+         native_device_context->RSSetViewports(num_viewports, viewports);
+      }
+      if (num_scissors > 0)
+      {
+         native_device_context->RSSetScissorRects(num_scissors, scissors);
+      }
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, stages, LumaConstantBufferType::LumaData);
+      updated_cbuffers = true;
+
+      game_device_data.valid_fixed_scale_twins.insert(target.get());
+      return true;
+   }
+
+   DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
+   {
+      if (DrawFixedScaleTwinPass(native_device, native_device_context, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func))
+      {
+         return DrawOrDispatchOverrideType::Replaced;
+      }
+      return DrawOrDispatchOverrideType::None;
+   }
+
 #if ENABLE_FAST_NOISE_TEXTURES
    static DrawOrDispatchOverrideType OnDraw_SSAO_Temporal(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func)
    {
@@ -1055,6 +1331,19 @@ public:
 
          cb_luma_global_settings.DisplayMode = is_tonemapping_hdr ? DisplayModeType::HDR : DisplayModeType::SDR;
          device_data.cb_luma_global_settings_dirty = true;
+      }
+      // Read the upscaled twin of the scene instead of upscaling the render resolution one (this stays bound for the following output passes)
+      if (game_device_data.fixed_scale_upscaling)
+      {
+         com_ptr<ID3D11ShaderResourceView> original_srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+         if (BindFixedScaleTwinShaderResources(native_device_context, game_device_data, original_srvs))
+         {
+            game_device_data.drawing_fixed_scale_twin = true;
+         }
+         else
+         {
+            BreakFixedScaleChain(game_device_data, original_shader_hashes, "(output) doesn't read the upscaled image");
+         }
       }
       game_device_data.has_drawn_upscaling = true;       // This pass will make upscaling happen if DLSS didn't already do it before
       device_data.has_drawn_main_post_processing = true; // Post processing is finished, nothing more to fix
@@ -1407,30 +1696,61 @@ public:
             uint32_t num_viewports = 1;
             native_device_context->RSGetViewports(&num_viewports, &viewport);
             device_data.render_resolution = {viewport.Width, viewport.Height};
-            game_device_data.upscaled_render_resolution = {(float)taa_output_texture_desc.Width, (float)taa_output_texture_desc.Height};
-            game_device_data.resolution_scale = (float)device_data.render_resolution.x / (float)game_device_data.upscaled_render_resolution.x;
-            game_device_data.viewport_rect = {static_cast<uint32_t>(viewport.TopLeftX), static_cast<uint32_t>(viewport.TopLeftY), static_cast<uint32_t>(game_device_data.upscaled_render_resolution.x), static_cast<uint32_t>(game_device_data.upscaled_render_resolution.y)};
-            // Once DRS has engaged once, we can't really detect if it's been turned off ever again, anyway it's always active by default in this game (unless one has mods to disable it, or fix a scaled render resolution)
-            if (!game_device_data.drs_active && game_device_data.resolution_scale == 1.0f)
+
+            // A fixed render scale ("r.ScreenPercentage"): the view covers the whole (render resolution sized, slightly padded) texture, which is smaller than the output.
+            // DRS instead renders in the top left of output sized textures.
+            constexpr uint32_t max_render_target_padding = 16;
+            const float output_aspect_ratio = device_data.output_resolution.x / device_data.output_resolution.y;
+            const bool fixed_scale = viewport.TopLeftX == 0.f && viewport.TopLeftY == 0.f && viewport.Width >= 1.f && viewport.Height >= 1.f
+               && taa_output_texture_desc.Width >= viewport.Width && taa_output_texture_desc.Width - viewport.Width <= max_render_target_padding
+               && taa_output_texture_desc.Height >= viewport.Height && taa_output_texture_desc.Height - viewport.Height <= max_render_target_padding
+               && viewport.Width < device_data.output_resolution.x * 0.99f && viewport.Height < device_data.output_resolution.y * 0.99f
+               && std::abs((viewport.Width / viewport.Height) / output_aspect_ratio - 1.f) < 0.01f;
+
+            if (fixed_scale)
             {
-               device_data.sr_render_resolution_scale = 1.0f;
-            }
-            else if (game_device_data.resolution_scale < 0.5f - FLT_EPSILON)
-            {
+               game_device_data.upscaled_render_resolution = device_data.output_resolution;
+               game_device_data.resolution_scale = device_data.render_resolution.x / game_device_data.upscaled_render_resolution.x;
+               game_device_data.viewport_rect = {0, 0, static_cast<uint32_t>(game_device_data.upscaled_render_resolution.x), static_cast<uint32_t>(game_device_data.upscaled_render_resolution.y)};
+               game_device_data.fixed_scale_render_target_size = {taa_output_texture_desc.Width, taa_output_texture_desc.Height};
+               game_device_data.fixed_scale_render_size = {static_cast<uint32_t>(std::lrintf(viewport.Width)), static_cast<uint32_t>(std::lrintf(viewport.Height))};
+               game_device_data.fixed_scale_output_size = {static_cast<uint32_t>(std::lrintf(device_data.output_resolution.x)), static_cast<uint32_t>(std::lrintf(device_data.output_resolution.y))};
                device_data.sr_render_resolution_scale = game_device_data.resolution_scale;
-               game_device_data.drs_active = true;
             }
             else
             {
-               // This should pick quality or balanced mode, with a range from 100% to 50% resolution scale
-               device_data.sr_render_resolution_scale = 1.f / 1.5f;
-               game_device_data.drs_active = true;
+               game_device_data.upscaled_render_resolution = {(float)taa_output_texture_desc.Width, (float)taa_output_texture_desc.Height};
+               game_device_data.resolution_scale = (float)device_data.render_resolution.x / (float)game_device_data.upscaled_render_resolution.x;
+               game_device_data.viewport_rect = {static_cast<uint32_t>(viewport.TopLeftX), static_cast<uint32_t>(viewport.TopLeftY), static_cast<uint32_t>(game_device_data.upscaled_render_resolution.x), static_cast<uint32_t>(game_device_data.upscaled_render_resolution.y)};
+            }
+            // Once DRS has engaged once, we can't really detect if it's been turned off ever again, anyway it's always active by default in this game (unless one has mods to disable it, or fix a scaled render resolution)
+            if (!fixed_scale)
+            {
+               if (!game_device_data.drs_active && game_device_data.resolution_scale == 1.0f)
+               {
+                  device_data.sr_render_resolution_scale = 1.0f;
+               }
+               else if (game_device_data.resolution_scale < 0.5f - FLT_EPSILON)
+               {
+                  device_data.sr_render_resolution_scale = game_device_data.resolution_scale;
+                  game_device_data.drs_active = true;
+               }
+               else
+               {
+                  // This should pick quality or balanced mode, with a range from 100% to 50% resolution scale
+                  device_data.sr_render_resolution_scale = 1.f / 1.5f;
+                  game_device_data.drs_active = true;
+               }
             }
 
             // The TAA input and output textures were guaranteed to be of the same size, so we pass in the output one as render res,
             // scaled by the DLSS render resolution scaling factor (which is a fixed multiplication to enabled dynamic res scaling in DLSS, it doesn't change every frame, as long as the res doesn't drop below 50%).
             double target_aspect_ratio = (double)game_device_data.upscaled_render_resolution.x / (double)game_device_data.upscaled_render_resolution.y;
             std::array<uint32_t, 2> dlss_input_resolution = FindClosestIntegerResolutionForAspectRatio((double)taa_output_texture_desc.Width * device_data.sr_render_resolution_scale, (double)taa_output_texture_desc.Height * device_data.sr_render_resolution_scale, target_aspect_ratio);
+            if (fixed_scale)
+            {
+               dlss_input_resolution = {game_device_data.fixed_scale_render_size.x, game_device_data.fixed_scale_render_size.y};
+            }
 
             if (dlss_input_resolution[0] > game_device_data.upscaled_render_resolution.x || dlss_input_resolution[1] > game_device_data.upscaled_render_resolution.y)
             {
@@ -1443,7 +1763,7 @@ public:
             settings_data.output_height = game_device_data.upscaled_render_resolution.y;
             settings_data.render_width = dlss_input_resolution[0];
             settings_data.render_height = dlss_input_resolution[1];
-            settings_data.dynamic_resolution = game_device_data.drs_active;
+            settings_data.dynamic_resolution = game_device_data.drs_active && !fixed_scale;
             settings_data.hdr = true; // Unreal Engine does DLSS before tonemapping, in HDR linear space
             settings_data.inverted_depth = true;
             settings_data.mvs_jittered = false;
@@ -1458,8 +1778,30 @@ public:
 
             constexpr bool dlss_use_native_uav = true;
             bool dlss_output_supports_uav = dlss_use_native_uav && (taa_output_texture_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
+            if (fixed_scale)
+            {
+               // SR writes into the output resolution twin of the TAA output, the game's TAA still fills the original
+               const auto prev_twin = game_device_data.fixed_scale_twins.find(output_color_resource.get());
+               const ID3D11Texture2D* prev_twin_texture = prev_twin != game_device_data.fixed_scale_twins.end() ? prev_twin->second.texture.get() : nullptr;
+               FixedScaleTwin* twin = GetOrCreateFixedScaleTwin(native_device, game_device_data, output_color_resource.get(), true);
+               if (twin == nullptr)
+               {
+                  static bool logged_twin_failure = false;
+                  if (!logged_twin_failure)
+                  {
+                     logged_twin_failure = true;
+                     reshade::log::message(reshade::log::level::warning, "Fixed scale upscaling: couldn't create the output resolution TAA texture");
+                  }
+                  skip_dlss = true;
+               }
+               else
+               {
+                  dlss_output_changed = twin->texture.get() != prev_twin_texture;
+                  device_data.sr_output_color = twin->texture;
+               }
+            }
             // Create a copy that supports Unordered Access if it wasn't already supported
-            if (!dlss_output_supports_uav)
+            else if (!dlss_output_supports_uav)
             {
                D3D11_TEXTURE2D_DESC dlss_output_texture_desc = taa_output_texture_desc;
                dlss_output_texture_desc.Width = std::lrintf(game_device_data.upscaled_render_resolution.x);
@@ -1622,6 +1964,15 @@ public:
                draw_state_stack.Restore(native_device_context, device_data.uav_max_count);
                compute_state_stack.Restore(native_device_context, device_data.uav_max_count);
 
+               if (device_data.has_drawn_sr && fixed_scale)
+               {
+                  device_data.sr_output_color = nullptr;
+                  game_device_data.fixed_scale_upscaling = true;
+                  game_device_data.valid_fixed_scale_twins.clear();
+                  game_device_data.valid_fixed_scale_twins.insert(output_color_resource.get());
+                  // Let the game's TAA draw too, its render resolution output feeds the passes we don't re-draw at output resolution (e.g. the bloom downscale)
+                  return DrawOrDispatchOverrideType::None;
+               }
                if (device_data.has_drawn_sr)
                {
                   // Upscaling happened later (during tonemapping) natively but we anticipate it with DLSS
@@ -1650,7 +2001,7 @@ public:
                   device_data.force_reset_sr = true;
                }
             }
-            if (dlss_output_supports_uav)
+            if (dlss_output_supports_uav || fixed_scale)
             {
                device_data.sr_output_color = nullptr;
             }
@@ -1673,6 +2024,10 @@ public:
       ID3D11SamplerState* const linear_sampler = device_data.sampler_state_linear.get();
       native_device_context->PSSetSamplers(0, 1, &linear_sampler);
 #endif
+      if (DrawFixedScaleTwinPass(native_device, native_device_context, cmd_list_data, device_data, stages, original_shader_hashes, is_custom_pass, updated_cbuffers, original_draw_dispatch_func))
+      {
+         return DrawOrDispatchOverrideType::Replaced;
+      }
       return DrawOrDispatchOverrideType::None;
    }
 
@@ -1694,6 +2049,9 @@ public:
       }
       game_device_data.has_drawn_taa = false;
       device_data.has_drawn_sr = false;
+      game_device_data.fixed_scale_upscaling = false;
+      game_device_data.drawing_fixed_scale_twin = false;
+      game_device_data.valid_fixed_scale_twins.clear();
       game_device_data.found_per_view_globals = false;
       device_data.cb_luma_global_settings_dirty = true;
       static std::mt19937 random_generator(std::chrono::system_clock::now().time_since_epoch().count());
@@ -1712,6 +2070,8 @@ public:
       game_device_data.depth_buffer = nullptr;
       game_device_data.sr_settings_data = nullptr;
       game_device_data.sr_draw_data = nullptr;
+      game_device_data.fixed_scale_twins.clear();
+      game_device_data.valid_fixed_scale_twins.clear();
    }
 
    void PrintImGuiAbout() override
@@ -1802,6 +2162,13 @@ public:
       data.GameData.OutputResolution = {game_device_data.upscaled_render_resolution.x, game_device_data.upscaled_render_resolution.y, 1.0f / game_device_data.upscaled_render_resolution.x, 1.0f / game_device_data.upscaled_render_resolution.y};
       data.GameData.ResolutionScale = {game_device_data.resolution_scale, 1.0f / game_device_data.resolution_scale};
       data.GameData.DrewUpscaling = device_data.has_drawn_sr ? 1 : 0;
+      data.GameData.FixedScaleUpscaling = 0;
+      if (game_device_data.fixed_scale_upscaling)
+      {
+         // Only the draws into the twins (and the output pass reading them) are at output resolution, the native ones keep the game's sizes
+         data.GameData.DrewUpscaling = game_device_data.drawing_fixed_scale_twin ? 1 : 0;
+         data.GameData.FixedScaleUpscaling = game_device_data.drawing_fixed_scale_twin ? 1 : 0;
+      }
       data.GameData.ViewportRect = game_device_data.viewport_rect;
 
       can_sharpen = device_data.output_resolution.x == game_device_data.upscaled_render_resolution.x && device_data.output_resolution.y == game_device_data.upscaled_render_resolution.y;
